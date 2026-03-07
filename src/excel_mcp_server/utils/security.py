@@ -1,6 +1,7 @@
 """Security utilities for Excel MCP Server"""
 
 import logging
+import re
 from pathlib import Path
 from typing import Tuple, Any
 
@@ -110,6 +111,7 @@ class CellValidator:
     
     MAX_COLUMN = 16384  # XFD
     MAX_ROW = 1048576
+    CELL_PATTERN = re.compile(r'^([A-Z]{1,3})(\d+)$', re.IGNORECASE)
     
     @classmethod
     def _column_to_number(cls, col: str) -> int:
@@ -122,20 +124,11 @@ class CellValidator:
     @classmethod
     def validate_cell(cls, cell: str) -> Tuple[bool, str, Tuple[int, int] | None]:
         """Validate cell reference."""
-        normalized = cell.strip().upper()
-        split_at = 0
-        while split_at < len(normalized) and normalized[split_at].isalpha():
-            split_at += 1
-
-        col_str = normalized[:split_at]
-        row_str = normalized[split_at:]
-
-        if not col_str or not row_str:
+        match = cls.CELL_PATTERN.match(cell.strip())
+        if not match:
             return False, f"Invalid cell reference format", None
 
-        if len(col_str) > 3 or not col_str.isalpha() or not row_str.isdigit():
-            return False, f"Invalid cell reference format", None
-
+        col_str, row_str = match.groups()
         col_num = cls._column_to_number(col_str)
         row_num = int(row_str)
         
@@ -200,6 +193,7 @@ class FormulaValidator:
     }
     WARN_ONLY_FUNCTIONS = {"HYPERLINK"}
     FUNCTION_PREFIXES = ("_XLFN.", "_XLWS.")
+    SYNTHESIZED_OPEN_PAREN_FUNCTIONS = {"CHAR", "UNICHAR"}
 
     @classmethod
     def _normalize_function_name(cls, token_value: str) -> str:
@@ -218,6 +212,42 @@ class FormulaValidator:
                     changed = True
 
         return normalized
+
+    @classmethod
+    def _next_meaningful_token(cls, tokens: list, start_index: int) -> tuple[int | None, Any | None]:
+        """Return the next non-whitespace token."""
+        for index in range(start_index, len(tokens)):
+            token = tokens[index]
+            if token.type != "WHITE-SPACE":
+                return index, token
+        return None, None
+
+    @classmethod
+    def _is_synthesized_open_parenthesis(cls, tokens: list, start_index: int) -> bool:
+        """Detect concatenations that try to manufacture an opening parenthesis."""
+        token_index, token = cls._next_meaningful_token(tokens, start_index)
+        if token is None:
+            return False
+
+        if token.type == "OPERAND" and token.subtype == "TEXT":
+            return token.value in {'"("', "'('"}
+
+        if token.type != "FUNC" or token.subtype != "OPEN":
+            return False
+
+        function_name = cls._normalize_function_name(token.value)
+        if function_name not in cls.SYNTHESIZED_OPEN_PAREN_FUNCTIONS:
+            return False
+
+        arg_index, arg_token = cls._next_meaningful_token(tokens, token_index + 1)
+        if arg_token is None or arg_token.type != "OPERAND":
+            return False
+
+        if str(arg_token.value).strip() != "40":
+            return False
+
+        _, close_token = cls._next_meaningful_token(tokens, arg_index + 1)
+        return close_token is not None and close_token.type == "FUNC" and close_token.subtype == "CLOSE"
 
     @classmethod
     def _contains_unquoted_pipe(cls, formula: str) -> bool:
@@ -273,8 +303,35 @@ class FormulaValidator:
             logger.warning("Blocked formula that failed tokenization")
             return False, "Formula contains unsupported or unsafe syntax"
 
-        for token in tokens:
+        for index, token in enumerate(tokens):
             if token.type != "FUNC" or token.subtype != "OPEN":
+                if token.type == "OPERAND" and token.subtype == "RANGE":
+                    function_name = cls._normalize_function_name(token.value)
+                    if function_name not in cls.BLOCKED_FUNCTIONS:
+                        continue
+
+                    next_index, next_token = cls._next_meaningful_token(tokens, index + 1)
+                    if next_token is None:
+                        continue
+
+                    if next_token.type == "PAREN" and next_token.subtype == "OPEN":
+                        logger.warning(
+                            "Blocked formula containing dangerous function with whitespace bypass: %s",
+                            function_name,
+                        )
+                        return False, "Formula contains blocked function for security reasons"
+
+                    if (
+                        next_token.type == "OPERATOR-INFIX"
+                        and next_token.value == "&"
+                        and cls._is_synthesized_open_parenthesis(tokens, next_index + 1)
+                    ):
+                        logger.warning(
+                            "Blocked formula containing dangerous function with synthesized parenthesis: %s",
+                            function_name,
+                        )
+                        return False, "Formula contains blocked function for security reasons"
+
                 continue
 
             function_name = cls._normalize_function_name(token.value)

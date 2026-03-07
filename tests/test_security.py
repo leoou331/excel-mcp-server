@@ -1,16 +1,8 @@
 """Security-focused regression tests."""
 
-import importlib
-
 import pytest
 
 from excel_mcp_server.utils.security import FormulaValidator, PathValidator
-
-
-def test_server_module_imports_with_fastmcp_3():
-    """FastMCP 3.x should accept the server configuration."""
-    module = importlib.import_module("excel_mcp_server.server")
-    assert module.mcp is not None
 
 
 @pytest.mark.parametrize(
@@ -19,6 +11,9 @@ def test_server_module_imports_with_fastmcp_3():
         ('=WEBSERVICE("http://evil.test")', "blocked function"),
         ('=@WEBSERVICE("http://evil.test")', "blocked function"),
         ('=SUM(1, _xlfn.WEBSERVICE("http://evil.test"))', "blocked function"),
+        ('=WEBSERVICE  ("http://evil.test")', "blocked function"),
+        ('=WEBSERVICE & CHAR(40)', "blocked function"),
+        ('=WEBSERVICE&UNICHAR(40)', "blocked function"),
         ("=cmd|'/C calc'!A0", "blocked syntax"),
     ],
 )

@@ -27,6 +27,7 @@ class SecurityConfig(BaseModel):
         r'=.*REGISTER\(',
     ])
     lock_timeout_seconds: int = 30
+    lock_stale_seconds: int = 300
 
 
 class Settings(BaseModel):
