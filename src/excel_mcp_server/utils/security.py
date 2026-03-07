@@ -1,9 +1,11 @@
 """Security utilities for Excel MCP Server"""
 
 import logging
-import re
 from pathlib import Path
 from typing import Tuple, Any
+
+from openpyxl.formula import Tokenizer
+from openpyxl.formula.tokenizer import TokenizerError
 
 from ..config import settings
 
@@ -33,16 +35,19 @@ class PathValidator:
         check_allowed: bool = True
     ) -> Tuple[bool, str]:
         """Validate a file path for security and correctness."""
+        raw_parts = [
+            part for part in str(path).replace('\\', '/').split('/')
+            if part and part != '.'
+        ]
+        if '..' in raw_parts:
+            return False, "Path traversal is not allowed"
+
+        raw_path = Path(path)
+
         try:
-            p = Path(path).resolve()
-        except Exception as e:
+            p = raw_path.resolve()
+        except Exception:
             return False, f"Invalid path format"
-        
-        # Check path traversal - compare resolved path with original
-        original_resolved = Path(path).resolve()
-        if '..' in str(path) or original_resolved != p:
-            # Allow if the resolved path is still valid
-            pass  # resolve() already handles this
         
         # Check for forbidden characters
         name = p.name
@@ -105,7 +110,6 @@ class CellValidator:
     
     MAX_COLUMN = 16384  # XFD
     MAX_ROW = 1048576
-    CELL_PATTERN = re.compile(r'^([A-Z]{1,3})(\d+)$', re.IGNORECASE)
     
     @classmethod
     def _column_to_number(cls, col: str) -> int:
@@ -118,11 +122,20 @@ class CellValidator:
     @classmethod
     def validate_cell(cls, cell: str) -> Tuple[bool, str, Tuple[int, int] | None]:
         """Validate cell reference."""
-        match = cls.CELL_PATTERN.match(cell.strip())
-        if not match:
+        normalized = cell.strip().upper()
+        split_at = 0
+        while split_at < len(normalized) and normalized[split_at].isalpha():
+            split_at += 1
+
+        col_str = normalized[:split_at]
+        row_str = normalized[split_at:]
+
+        if not col_str or not row_str:
             return False, f"Invalid cell reference format", None
-        
-        col_str, row_str = match.groups()
+
+        if len(col_str) > 3 or not col_str.isalpha() or not row_str.isdigit():
+            return False, f"Invalid cell reference format", None
+
         col_num = cls._column_to_number(col_str)
         row_num = int(row_str)
         
@@ -171,23 +184,69 @@ class CellValidator:
 class FormulaValidator:
     """Validates Excel formulas for security"""
     
-    # Dangerous patterns that could be used for attacks
-    DANGEROUS_PATTERNS = [
-        r'=.*cmd\|',           # DDE command injection
-        r'=.*\|.*!',           # DDE attack pattern
-        r'=.*WEBSERVICE\s*\(', # External web requests
-        r'=.*IMPORTDATA\s*\(', # Import external data
-        r'=.*IMPORTHTML\s*\(', # Import HTML
-        r'=.*IMPORTXML\s*\(',  # Import XML
-        r'=.*EXECUTE\s*\(',    # Execute commands (legacy)
-        r'=.*CALL\s*\(',       # DLL calls
-        r'=.*REGISTER\s*\(',   # DLL registration
-        r'=.*REGISTER\.ID\s*\(', # DLL registration ID
-        r'=.*GET\.CELL\s*\(',  # Get cell info (can leak data)
-        r'=.*GET\.WORKBOOK\s*\(', # Get workbook info
-        r'=.*LINKS\s*\(',      # External links
-        r'=.*REQUEST\s*\(',    # DDE request
-    ]
+    BLOCKED_FUNCTIONS = {
+        "WEBSERVICE",
+        "IMPORTDATA",
+        "IMPORTHTML",
+        "IMPORTXML",
+        "EXECUTE",
+        "CALL",
+        "REGISTER",
+        "REGISTER.ID",
+        "GET.CELL",
+        "GET.WORKBOOK",
+        "LINKS",
+        "REQUEST",
+    }
+    WARN_ONLY_FUNCTIONS = {"HYPERLINK"}
+    FUNCTION_PREFIXES = ("_XLFN.", "_XLWS.")
+
+    @classmethod
+    def _normalize_function_name(cls, token_value: str) -> str:
+        """Normalize a function token for security checks."""
+        normalized = token_value.rstrip('(').strip().upper()
+
+        while normalized.startswith('@'):
+            normalized = normalized[1:]
+
+        changed = True
+        while changed:
+            changed = False
+            for prefix in cls.FUNCTION_PREFIXES:
+                if normalized.startswith(prefix):
+                    normalized = normalized[len(prefix):]
+                    changed = True
+
+        return normalized
+
+    @classmethod
+    def _contains_unquoted_pipe(cls, formula: str) -> bool:
+        """Detect DDE-style pipe syntax outside quoted strings."""
+        quote_char: str | None = None
+        index = 0
+
+        while index < len(formula):
+            char = formula[index]
+            if quote_char:
+                if char == quote_char:
+                    if index + 1 < len(formula) and formula[index + 1] == quote_char:
+                        index += 2
+                        continue
+                    quote_char = None
+                index += 1
+                continue
+
+            if char in {'"', "'"}:
+                quote_char = char
+                index += 1
+                continue
+
+            if char == '|':
+                return True
+
+            index += 1
+
+        return False
     
     @classmethod
     def validate_formula(cls, formula: str) -> Tuple[bool, str]:
@@ -203,16 +262,31 @@ class FormulaValidator:
         # Check length
         if len(normalized) > settings.security.max_formula_length:
             return False, f"Formula too long (max {settings.security.max_formula_length} chars)"
-        
-        # Check for dangerous patterns
-        for pattern in cls.DANGEROUS_PATTERNS:
-            if re.search(pattern, normalized, re.IGNORECASE):
-                logger.warning(f"Blocked formula containing dangerous pattern: {pattern}")
+
+        if cls._contains_unquoted_pipe(normalized):
+            logger.warning("Blocked formula containing DDE-style pipe syntax")
+            return False, "Formula contains blocked syntax for security reasons"
+
+        try:
+            tokens = Tokenizer(normalized).items
+        except TokenizerError:
+            logger.warning("Blocked formula that failed tokenization")
+            return False, "Formula contains unsupported or unsafe syntax"
+
+        for token in tokens:
+            if token.type != "FUNC" or token.subtype != "OPEN":
+                continue
+
+            function_name = cls._normalize_function_name(token.value)
+            if function_name in cls.BLOCKED_FUNCTIONS:
+                logger.warning(
+                    "Blocked formula containing dangerous function: %s",
+                    function_name,
+                )
                 return False, "Formula contains blocked function for security reasons"
-        
-        # Additional check for HYPERLINK - allow but log
-        if re.search(r'=.*HYPERLINK\s*\(', normalized, re.IGNORECASE):
-            logger.warning(f"Formula contains HYPERLINK function")
+
+            if function_name in cls.WARN_ONLY_FUNCTIONS:
+                logger.warning("Formula contains HYPERLINK function")
         
         return True, ""
 
