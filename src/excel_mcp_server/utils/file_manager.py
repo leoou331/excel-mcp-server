@@ -24,6 +24,19 @@ class FileManager:
     LOCK_DIRNAME = ".excel_locks"
     LOCK_SUFFIX = ".lock"
 
+    def _safe_resolve(self, file_path: str | Path) -> Path:
+        """Resolve a workbook path and enforce allowed-directory boundaries."""
+        resolved = Path(file_path).resolve()
+        allowed_directories = settings.security.allowed_directories
+
+        if not allowed_directories:
+            return resolved
+
+        if any(resolved.is_relative_to(allowed) for allowed in allowed_directories):
+            return resolved
+
+        raise SecurityError(f"Path not in allowed directories: {resolved}")
+
     def _get_lock_dir(self, path: Path) -> Path:
         """Return the directory used for workbook lock files."""
         return path.parent / self.LOCK_DIRNAME
@@ -91,7 +104,7 @@ class FileManager:
         except Exception:
             temp_path.unlink(missing_ok=True)
             raise
-    
+
     @contextmanager
     def safe_open(
         self,
@@ -101,24 +114,24 @@ class FileManager:
         timeout: Optional[float] = None,
     ) -> Generator[WorkbookType, None, None]:
         """Safely open an Excel workbook with file locking."""
-        path = Path(file_path).resolve()
+        path = self._safe_resolve(file_path)
         timeout = timeout or settings.security.lock_timeout_seconds
-        
+
         # Create lock file path
         lock_dir = self._get_lock_dir(path)
         lock_dir.mkdir(exist_ok=True)
         self._cleanup_stale_locks(lock_dir)
         lock_path = self._get_lock_path(path)
         lock = FileLock(str(lock_path), timeout=timeout)
-        
+
         wb: Optional[WorkbookType] = None
         lock_acquired = False
-        
+
         try:
             lock.acquire(blocking=True)
             lock_acquired = True
             logger.debug(f"Lock acquired for {path}")
-            
+
             if path.exists():
                 wb = load_workbook(
                     str(path),
@@ -130,9 +143,9 @@ class FileManager:
                 wb = Workbook()
             else:
                 raise SecurityError(f"File not found: {path}")
-            
+
             yield wb
-            
+
         except Timeout:
             logger.error(f"Failed to acquire lock for {path}")
             raise SecurityError(f"File is locked by another process: {path}")
@@ -146,7 +159,7 @@ class FileManager:
                     logger.debug(f"Workbook closed: {path}")
                 except Exception as e:
                     logger.warning(f"Error closing workbook: {e}")
-            
+
             if lock_acquired:
                 try:
                     lock.release()
@@ -154,7 +167,7 @@ class FileManager:
                 except Exception as e:
                     logger.warning(f"Error releasing lock: {e}")
                 self._cleanup_lock_file(lock_path)
-    
+
     @contextmanager
     def safe_write(
         self,
@@ -162,8 +175,8 @@ class FileManager:
         timeout: Optional[float] = None,
     ) -> Generator[WorkbookType, None, None]:
         """Safely open an Excel workbook for writing with auto-save."""
-        path = Path(file_path).resolve()
-        
+        path = self._safe_resolve(file_path)
+
         with self.safe_open(path, read_only=False, data_only=False, timeout=timeout) as wb:
             try:
                 yield wb
@@ -172,21 +185,21 @@ class FileManager:
             except Exception as e:
                 logger.error(f"Error during write, changes not saved: {e}")
                 raise
-    
+
     def safe_create(
         self,
         file_path: str | Path,
         timeout: Optional[float] = None,
     ) -> bool:
         """Create a new Excel workbook. Returns True if created."""
-        path = Path(file_path).resolve()
-        
+        path = self._safe_resolve(file_path)
+
         if path.exists():
             return False
-        
+
         with self.safe_write(path, timeout=timeout) as wb:
             pass  # Workbook created automatically
-        
+
         return True
 
 

@@ -1,7 +1,12 @@
 """Security-focused regression tests."""
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
+from excel_mcp_server import add_allowed_directory
+from excel_mcp_server.config import settings
 from excel_mcp_server.utils.security import FormulaValidator, PathValidator
 
 
@@ -37,3 +42,28 @@ def test_path_validator_rejects_traversal_segments(path):
     is_valid, error = PathValidator.validate_path(path, check_allowed=False)
     assert not is_valid
     assert "traversal" in error.lower()
+
+
+def test_path_validator_rejects_allowed_directory_prefix_bypass():
+    """Sibling directories with a shared prefix are not inside the allowlist."""
+    original_allowed_directories = list(settings.security.allowed_directories)
+    settings.security.allowed_directories.clear()
+
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            allowed_dir = root / "allowed"
+            bypass_dir = root / "allowed_evil"
+            allowed_dir.mkdir()
+            bypass_dir.mkdir()
+            add_allowed_directory(allowed_dir)
+
+            is_valid, error = PathValidator.validate_path(
+                bypass_dir / "escape.xlsx",
+                check_allowed=True,
+            )
+
+            assert not is_valid
+            assert "allowed directories" in error.lower()
+    finally:
+        settings.security.allowed_directories[:] = original_allowed_directories
