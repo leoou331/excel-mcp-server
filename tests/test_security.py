@@ -20,6 +20,7 @@ from excel_mcp_server.utils.security import FormulaValidator, PathValidator
         ('=WEBSERVICE & CHAR(40)', "blocked function"),
         ('=WEBSERVICE&UNICHAR(40)', "blocked function"),
         ("=cmd|'/C calc'!A0", "blocked syntax"),
+        ("='cmd|/C calc'!A0", "blocked syntax"),
     ],
 )
 def test_formula_validator_blocks_unsafe_formula_shapes(formula, expected_error):
@@ -32,6 +33,13 @@ def test_formula_validator_blocks_unsafe_formula_shapes(formula, expected_error)
 def test_formula_validator_ignores_blocked_names_inside_strings():
     """String literals mentioning blocked functions should remain valid."""
     is_valid, error = FormulaValidator.validate_formula('="WEBSERVICE("')
+    assert is_valid
+    assert error == ""
+
+
+def test_formula_validator_allows_pipe_inside_double_quoted_string_literal():
+    """Quoted string content should not trigger the DDE pipe detector."""
+    is_valid, error = FormulaValidator.validate_formula('="cmd|/C calc"')
     assert is_valid
     assert error == ""
 

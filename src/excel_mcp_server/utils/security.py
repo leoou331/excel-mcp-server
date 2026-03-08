@@ -251,23 +251,23 @@ class FormulaValidator:
 
     @classmethod
     def _contains_unquoted_pipe(cls, formula: str) -> bool:
-        """Detect DDE-style pipe syntax outside quoted strings."""
-        quote_char: str | None = None
+        """Detect DDE-style pipe syntax outside Excel string literals."""
+        in_string = False
         index = 0
 
         while index < len(formula):
             char = formula[index]
-            if quote_char:
-                if char == quote_char:
-                    if index + 1 < len(formula) and formula[index + 1] == quote_char:
+            if in_string:
+                if char == '"':
+                    if index + 1 < len(formula) and formula[index + 1] == '"':
                         index += 2
                         continue
-                    quote_char = None
+                    in_string = False
                 index += 1
                 continue
 
-            if char in {'"', "'"}:
-                quote_char = char
+            if char == '"':
+                in_string = True
                 index += 1
                 continue
 
