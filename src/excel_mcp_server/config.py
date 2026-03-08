@@ -27,6 +27,7 @@ class SecurityConfig(BaseModel):
         r'=.*REGISTER\(',
     ])
     lock_timeout_seconds: int = 30
+    lock_stale_seconds: int = 300
 
 
 class Settings(BaseModel):
@@ -54,10 +55,7 @@ def is_path_allowed(path: str | Path) -> bool:
     if not settings.security.allowed_directories:
         return True
     resolved = Path(path).resolve()
-    for allowed in settings.security.allowed_directories:
-        try:
-            resolved.relative_to(allowed)
-            return True
-        except ValueError:
-            continue
-    return False
+    return any(
+        resolved.is_relative_to(allowed)
+        for allowed in settings.security.allowed_directories
+    )

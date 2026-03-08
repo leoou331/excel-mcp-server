@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Create FastMCP server
 mcp = FastMCP(
     "Excel MCP Server",
-    description="A robust MCP server for Excel file manipulation"
+    instructions="A robust MCP server for Excel file manipulation"
 )
 
 

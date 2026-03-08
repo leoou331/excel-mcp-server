@@ -5,6 +5,9 @@ import re
 from pathlib import Path
 from typing import Tuple, Any
 
+from openpyxl.formula import Tokenizer
+from openpyxl.formula.tokenizer import TokenizerError
+
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -33,16 +36,19 @@ class PathValidator:
         check_allowed: bool = True
     ) -> Tuple[bool, str]:
         """Validate a file path for security and correctness."""
+        raw_parts = [
+            part for part in str(path).replace('\\', '/').split('/')
+            if part and part != '.'
+        ]
+        if '..' in raw_parts:
+            return False, "Path traversal is not allowed"
+
+        raw_path = Path(path)
+
         try:
-            p = Path(path).resolve()
-        except Exception as e:
+            p = raw_path.resolve()
+        except Exception:
             return False, f"Invalid path format"
-        
-        # Check path traversal - compare resolved path with original
-        original_resolved = Path(path).resolve()
-        if '..' in str(path) or original_resolved != p:
-            # Allow if the resolved path is still valid
-            pass  # resolve() already handles this
         
         # Check for forbidden characters
         name = p.name
@@ -121,7 +127,7 @@ class CellValidator:
         match = cls.CELL_PATTERN.match(cell.strip())
         if not match:
             return False, f"Invalid cell reference format", None
-        
+
         col_str, row_str = match.groups()
         col_num = cls._column_to_number(col_str)
         row_num = int(row_str)
@@ -171,23 +177,106 @@ class CellValidator:
 class FormulaValidator:
     """Validates Excel formulas for security"""
     
-    # Dangerous patterns that could be used for attacks
-    DANGEROUS_PATTERNS = [
-        r'=.*cmd\|',           # DDE command injection
-        r'=.*\|.*!',           # DDE attack pattern
-        r'=.*WEBSERVICE\s*\(', # External web requests
-        r'=.*IMPORTDATA\s*\(', # Import external data
-        r'=.*IMPORTHTML\s*\(', # Import HTML
-        r'=.*IMPORTXML\s*\(',  # Import XML
-        r'=.*EXECUTE\s*\(',    # Execute commands (legacy)
-        r'=.*CALL\s*\(',       # DLL calls
-        r'=.*REGISTER\s*\(',   # DLL registration
-        r'=.*REGISTER\.ID\s*\(', # DLL registration ID
-        r'=.*GET\.CELL\s*\(',  # Get cell info (can leak data)
-        r'=.*GET\.WORKBOOK\s*\(', # Get workbook info
-        r'=.*LINKS\s*\(',      # External links
-        r'=.*REQUEST\s*\(',    # DDE request
-    ]
+    BLOCKED_FUNCTIONS = {
+        "WEBSERVICE",
+        "IMPORTDATA",
+        "IMPORTHTML",
+        "IMPORTXML",
+        "EXECUTE",
+        "CALL",
+        "REGISTER",
+        "REGISTER.ID",
+        "GET.CELL",
+        "GET.WORKBOOK",
+        "LINKS",
+        "REQUEST",
+    }
+    WARN_ONLY_FUNCTIONS = {"HYPERLINK"}
+    FUNCTION_PREFIXES = ("_XLFN.", "_XLWS.")
+    SYNTHESIZED_OPEN_PAREN_FUNCTIONS = {"CHAR", "UNICHAR"}
+
+    @classmethod
+    def _normalize_function_name(cls, token_value: str) -> str:
+        """Normalize a function token for security checks."""
+        normalized = token_value.rstrip('(').strip().upper()
+
+        while normalized.startswith('@'):
+            normalized = normalized[1:]
+
+        changed = True
+        while changed:
+            changed = False
+            for prefix in cls.FUNCTION_PREFIXES:
+                if normalized.startswith(prefix):
+                    normalized = normalized[len(prefix):]
+                    changed = True
+
+        return normalized
+
+    @classmethod
+    def _next_meaningful_token(cls, tokens: list, start_index: int) -> tuple[int | None, Any | None]:
+        """Return the next non-whitespace token."""
+        for index in range(start_index, len(tokens)):
+            token = tokens[index]
+            if token.type != "WHITE-SPACE":
+                return index, token
+        return None, None
+
+    @classmethod
+    def _is_synthesized_open_parenthesis(cls, tokens: list, start_index: int) -> bool:
+        """Detect concatenations that try to manufacture an opening parenthesis."""
+        token_index, token = cls._next_meaningful_token(tokens, start_index)
+        if token is None:
+            return False
+
+        if token.type == "OPERAND" and token.subtype == "TEXT":
+            return token.value in {'"("', "'('"}
+
+        if token.type != "FUNC" or token.subtype != "OPEN":
+            return False
+
+        function_name = cls._normalize_function_name(token.value)
+        if function_name not in cls.SYNTHESIZED_OPEN_PAREN_FUNCTIONS:
+            return False
+
+        arg_index, arg_token = cls._next_meaningful_token(tokens, token_index + 1)
+        if arg_token is None or arg_token.type != "OPERAND":
+            return False
+
+        if str(arg_token.value).strip() != "40":
+            return False
+
+        _, close_token = cls._next_meaningful_token(tokens, arg_index + 1)
+        return close_token is not None and close_token.type == "FUNC" and close_token.subtype == "CLOSE"
+
+    @classmethod
+    def _contains_unquoted_pipe(cls, formula: str) -> bool:
+        """Detect DDE-style pipe syntax outside Excel string literals."""
+        in_string = False
+        index = 0
+
+        while index < len(formula):
+            char = formula[index]
+            if in_string:
+                if char == '"':
+                    if index + 1 < len(formula) and formula[index + 1] == '"':
+                        index += 2
+                        continue
+                    in_string = False
+                index += 1
+                continue
+
+            if char == '"':
+                in_string = True
+                index += 1
+                continue
+
+            if char == '|':
+                return True
+
+            index += 1
+
+        return False
     
     @classmethod
     def validate_formula(cls, formula: str) -> Tuple[bool, str]:
@@ -203,16 +292,58 @@ class FormulaValidator:
         # Check length
         if len(normalized) > settings.security.max_formula_length:
             return False, f"Formula too long (max {settings.security.max_formula_length} chars)"
-        
-        # Check for dangerous patterns
-        for pattern in cls.DANGEROUS_PATTERNS:
-            if re.search(pattern, normalized, re.IGNORECASE):
-                logger.warning(f"Blocked formula containing dangerous pattern: {pattern}")
+
+        if cls._contains_unquoted_pipe(normalized):
+            logger.warning("Blocked formula containing DDE-style pipe syntax")
+            return False, "Formula contains blocked syntax for security reasons"
+
+        try:
+            tokens = Tokenizer(normalized).items
+        except TokenizerError:
+            logger.warning("Blocked formula that failed tokenization")
+            return False, "Formula contains unsupported or unsafe syntax"
+
+        for index, token in enumerate(tokens):
+            if token.type != "FUNC" or token.subtype != "OPEN":
+                if token.type == "OPERAND" and token.subtype == "RANGE":
+                    function_name = cls._normalize_function_name(token.value)
+                    if function_name not in cls.BLOCKED_FUNCTIONS:
+                        continue
+
+                    next_index, next_token = cls._next_meaningful_token(tokens, index + 1)
+                    if next_token is None:
+                        continue
+
+                    if next_token.type == "PAREN" and next_token.subtype == "OPEN":
+                        logger.warning(
+                            "Blocked formula containing dangerous function with whitespace bypass: %s",
+                            function_name,
+                        )
+                        return False, "Formula contains blocked function for security reasons"
+
+                    if (
+                        next_token.type == "OPERATOR-INFIX"
+                        and next_token.value == "&"
+                        and cls._is_synthesized_open_parenthesis(tokens, next_index + 1)
+                    ):
+                        logger.warning(
+                            "Blocked formula containing dangerous function with synthesized parenthesis: %s",
+                            function_name,
+                        )
+                        return False, "Formula contains blocked function for security reasons"
+
+                continue
+
+            function_name = cls._normalize_function_name(token.value)
+            if function_name in cls.BLOCKED_FUNCTIONS:
+                logger.warning(
+                    "Blocked formula containing dangerous function: %s",
+                    function_name,
+                )
                 return False, "Formula contains blocked function for security reasons"
-        
-        # Additional check for HYPERLINK - allow but log
-        if re.search(r'=.*HYPERLINK\s*\(', normalized, re.IGNORECASE):
-            logger.warning(f"Formula contains HYPERLINK function")
+
+            if function_name in cls.WARN_ONLY_FUNCTIONS:
+                logger.warning("Formula contains HYPERLINK function")
         
         return True, ""
 
